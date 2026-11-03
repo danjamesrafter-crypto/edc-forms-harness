@@ -9513,7 +9513,7 @@ let FORMS = {}, FORM_KEYS = [], FORM_GROUPS = [];
 const PROJECT = { _id: '', label: '', info: {}, locked: null };
 const DB = { subjects: [], sessions: [], acquisitions: [], queries: [], changes: [] };
 let IMPORTS = [];
-const H = { ext: null, site: '', writable: false, user: null, roles: [], calls: [], err: null, loading: true, myRoles: [], admin: false, exposure: null, runs: 0 };
+const H = { ext: null, site: '', writable: false, user: null, roles: [], calls: [], err: null, loading: true, myRoles: [], admin: false, exposure: null, runs: 0, acq: { state: 'idle', n: 0, run: null } };
 const newEdc = () => ({ forms: {}, fw_edits: [], conflicts: [], locked_forms: [], source_file: '', row: '', imported: '', gear: 'EDC Forms harness', gear_version: '', job_id: '—' });
 
 async function api(m, path, params, body) {
@@ -9523,11 +9523,11 @@ async function api(m, path, params, body) {
   catch (e) { c.status = String((e && (e.status || e.message)) || e).slice(0, 120); c.ms = Math.round(performance.now() - t0); throw e; }
 }
 const keysOnly = o => o && typeof o === 'object' ? Object.keys(o).slice(0, 24).join(', ') : String(o);
-async function pageAll(path, params) {
-  let out = [], skip = 0; const limit = 500, seen = new Set();
+async function pageAll(path, params, limit = 500, onPage) {
+  let out = [], skip = 0; const seen = new Set();
   for (let i = 0; i < 40; i++) { const r = await api('GET', path, { ...params, limit, skip }), rows = Array.isArray(r) ? r : (r.results || []);
     rows.forEach(x => { const id = x._id || x.id; if (!seen.has(id)) { seen.add(id); out.push({ ...x, _id: id }); } });
-    if (rows.length < limit || (r.total && out.length >= r.total)) break; skip += limit; }
+    if (onPage) onPage(out); if (rows.length < limit || (r.total && out.length >= r.total)) break; skip += limit; }
   return out;
 }
 function setForms(forms) {
@@ -9543,13 +9543,25 @@ async function loadAll() {
   PROJECT.info.edc_source = { system: 'REDCap', dictionary: '—', built: '—', approved_by: '—', ...(E.source || {}) };
   setForms(E.forms); IMPORTS = [...(E.imports || [])].reverse(); DB.changes = E.changes || [];
   const norm = x => { x.info = x.info || {}; x.info.edc = { ...newEdc(), ...(x.info.edc || {}) }; x.parents = x.parents || {}; return x; };
-  DB.subjects = (await pageAll(`/projects/${pid}/subjects`, { include_all_info: true, sort: 'label:asc,_id:asc' })).map(norm);
+  const [subs, sess] = await Promise.all([pageAll(`/projects/${pid}/subjects`, { include_all_info: true, sort: 'label:asc,_id:asc' }), pageAll(`/projects/${pid}/sessions`, { include_all_info: true, sort: 'timestamp:asc,_id:asc' })]);
+  DB.subjects = subs.map(norm);
   DB.subjects.forEach(s => { s.label = s.label || s.code; });
-  DB.sessions = (await pageAll(`/projects/${pid}/sessions`, { include_all_info: true, sort: 'timestamp:asc,_id:asc' })).map(norm);
+  DB.sessions = sess.map(norm);
   DB.sessions.forEach(z => { z.parents.subject = z.parents.subject || (z.subject && (z.subject._id || z.subject.id)); });
-  DB.acquisitions = (await pageAll(`/projects/${pid}/acquisitions`, { include_all_info: true, sort: 'created:asc,_id:asc' })).map(norm);
   H.loading = false;
+  if (FORM_KEYS.some(k => FORMS[k].level === 'acquisition') && H.acq.state === 'idle') ensureAcq();
 }
+const needsImaging = k => FORMS[k] && FORMS[k].level === 'acquisition';
+/* Slowest read on the page, so it never blocks first paint. Runs in the background only when a form or an import needs it. */
+function ensureAcq(force) {
+  if (H.acq.state === 'loading' || (H.acq.state === 'ready' && !force)) return H.acq.run;
+  const norm = x => { x.info = x.info || {}; x.info.edc = { ...newEdc(), ...(x.info.edc || {}) }; x.parents = x.parents || {}; return x; };
+  H.acq.state = 'loading'; H.acq.n = 0; rerenderNow();
+  H.acq.run = pageAll(`/projects/${H.pid}/acquisitions`, { include_all_info: true, sort: 'created:asc,_id:asc' }, 100, rows => { H.acq.n = rows.length; rerenderNow(); })
+    .then(rows => { DB.acquisitions = rows.map(norm); H.acq.state = 'ready'; rerenderNow(); }).catch(() => { H.acq.state = 'error'; rerenderNow(); });
+  return H.acq.run;
+}
+const rerenderNow = () => { if (window.__efRender) window.__efRender(); };
 const subj = l => DB.subjects.find(s => s.label === l);
 const sessionsOf = s => DB.sessions.filter(z => z.parents.subject === s._id).sort((a, b) => String(a.timestamp || a.created || '').localeCompare(String(b.timestamp || b.created || '')));
 const edcPublic = x => { const { locked_forms, ...rest } = x.info.edc; return { ...rest, locked_forms }; };
@@ -9677,7 +9689,7 @@ const html = htm.bind(React.createElement);
 const VDS = window.FlywheelVisionDesignSystem_6c883d;
 const { Navbar, NavbarHeader, NavbarItem, NavbarDivider, NavbarSpacer, IconButton, Button, Icon, Tag, Badge, Avatar, Typography: T,
   AlertPanel, Dialog, Tabs, Tab, TabPanel, Table, PanelLayout, TextInput, TextArea, Select, SelectItem, RadioGroup, RadioButton, Checkbox,
-  WrappedInput, Stepper, Step, ContextLayout, Snackbar, SnackbarContainer, Tooltip, ProgressBar, Json, ButtonToggle, MenuItem, Chip } = VDS;
+  WrappedInput, Stepper, Step, ContextLayout, Snackbar, SnackbarContainer, Tooltip, ProgressBar, Json, ButtonToggle, MenuItem, Chip, Ghost } = VDS;
 
 /* ---------- roles (demo switch). In the product these come from the caller's project role. ---------- */
 const ROLES = {
@@ -9694,7 +9706,7 @@ const POL = () => PROJECT.info.edc_policy;
 const fmtV = (f, v) => Array.isArray(v) ? (v.join(', ') || 'None') : (v === '' || v == null ? '—' : String(v) + (f && f.unit ? ' ' + f.unit : ''));
 const now = () => new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
 const toast = (title, severity = 'success') => { S.toast = { title, severity, id: Date.now() }; rerender(); clearTimeout(toast.t); toast.t = setTimeout(() => { S.toast = null; rerender(); }, 3400); };
-const go = v => { S.view = v; S.edit = null; if (location.hash.slice(1) !== v) history.replaceState(null, '', '#' + v); if (S.narrow) S.navCollapsed = true; rerender(); document.querySelector('.ef-main')?.scrollTo(0, 0); };
+const go = v => { if (v === 'import') ensureAcq(); S.view = v; S.edit = null; if (location.hash.slice(1) !== v) history.replaceState(null, '', '#' + v); if (S.narrow) S.navCollapsed = true; rerender(); document.querySelector('.ef-main')?.scrollTo(0, 0); };
 const openSubject = (label, form, inst) => { S.sub = label; S.form = form || S.form || FORM_KEYS[0]; const list = instances(subj(label), S.form); S.inst = inst || (list.length ? list[list.length - 1].key : 'single'); S.tab = 'form'; go('subject'); };
 
 /* ---------- data adapter: the only code that knows where a form's record lives. Swap for ext.apiRequest in the harness. ---------- */
@@ -9756,8 +9768,10 @@ const PolicyTags = () => { const P = POL(); return html`${P.lock ? html`<${Tag} 
 const label = (s, k, inst) => { const f = FORMS[k]; return f.title + (f.repeat === 'visit' ? ' · ' + instLabel(inst) : f.repeat === 'instance' ? ' · Entry ' + (+inst + 1) : ''); };
 const fieldOf = (k, key) => FORMS[k].fields.find(f => f.key === key) || { label: key };
 
+const ImagingTag = () => H.acq.state === 'loading' ? html`<${Tag} size="large" color="primary" icon="clock-loading" title=${'Imaging ' + H.acq.n + ' Loaded'} />` : H.acq.state === 'error' ? html`<${Tag} size="large" color="red" title="Imaging Not Loaded" onClick=${() => ensureAcq(true)} />` : null;
 /* ---------- Forms: subject by form matrix ---------- */
 function statusCell(s, k) {
+  if (needsImaging(k) && H.acq.state !== 'ready') return html`<${Ghost} variant="text" width=${44} height=${12} />`;
   const fill = fillFor(s, k), ed = s.info.edc.fw_edits.filter(e => e.form === k).length, cf = s.info.edc.conflicts.filter(c => c.form === k && c.status === 'open').length, lk = s.info.edc.locked_forms.includes(k);
   if (!fill.n) return html`<button className="ef-cellbtn none" onClick=${e => { e.stopPropagation(); openSubject(s.label, k); }} aria-label=${s.label + ' ' + FORMS[k].title + ': no records'}>—</button>`;
   const full = fill.have >= fill.need;
@@ -9773,7 +9787,7 @@ function FormsPage() {
   const tot = DB.subjects.reduce((m, s) => { FORM_KEYS.forEach(k => { const f = fillFor(s, k); m.have += f.have; m.need += f.need; }); return m; }, { have: 0, need: 0 });
   const last = IMPORTS[0] || { id: '—', at: '', rows: 0 }, cf = openConflicts().length, ed = allEdits().length;
   return html`<${Head} eyebrow=${PROJECT.label + " · REDCap"} title="EDC Forms" sub="Clinical forms from the EDC, next to the imaging they describe. Everyone with access reads the same record. Changes are gated and logged."
-    actions=${html`<${PolicyTags} />${role().importer && html`<${Button} startIcon="upload" onClick=${() => go('import')}>New Import<//>`}`} />
+    actions=${html`<${ImagingTag} /><${PolicyTags} />${role().importer && html`<${Button} startIcon="upload" onClick=${() => go('import')}>New Import<//>`}`} />
   <div className="ef-stats">
     <${Stat} label="Subjects" value=${DB.subjects.length} sub=${sites.length ? sites.length + ' sites' : PROJECT.label} />
     <${Stat} label="Required Filled" value=${tot.need ? Math.round(100 * tot.have / tot.need) + '%' : '—'} sub=${tot.have.toLocaleString() + ' of ' + tot.need.toLocaleString() + ' required'} />
@@ -9888,7 +9902,7 @@ function SubjectPage() {
         <div className="ef-grow"><${Tabs} value=${S.tab} onChange=${v => { S.tab = v; rerender(); }}><${Tab} value="form" title="Form" icon="form-metadata-element" /><${Tab} value="def" title="Definition" icon="list-paragraph" /><${Tab} value="json" title="Record JSON" icon="code-text" /><//></div>
         ${!S.edit && S.tab === 'form' && open && html`<${Button} variant="outlined" color="slate" size="small" startIcon="message-question-checkmark" onClick=${() => { S.dialog = { type: 'query', k, inst, field: '', text: '' }; rerender(); }}>Raise Query...<//><${Button} size="small" startIcon="edit" disabled=${!ok} onClick=${startEdit}>Edit<//>`}
       </div>
-      ${S.tab === 'form' && (open ? html`
+      ${S.tab === 'form' && (needsImaging(k) && H.acq.state !== 'ready' ? html`<${Card}><div className="ef-stack"><${T} variant="p3" color="muted">Loading imaging records. ${H.acq.n} acquisitions so far.<//><${Ghost} variant="text" height=${16} /><${Ghost} variant="text" height=${16} /><${Ghost} variant="text" height=${16} /></div><//>` : open ? html`
         <${Gates} s=${s} k=${k} />
         ${list.length > 1 && !S.edit && html`<div className="ef-inst"><${ButtonToggle} key=${k + list.length} value=${inst} size="small" color="slate" selectedColor="primary" onChange=${v => { S.inst = v; rerender(); }} aria-label="Entry">${list.map(x => html`<${Button} key=${x.key} value=${x.key}>${x.label}<//>`)}<//></div>`}
         <${EdcFormView} s=${s} k=${k} inst=${inst} />` : html`<${Card}><${ContextLayout} size="compact" icon="document-file-blank" title="No Records" description=${s.label + ' has no ' + F.title + ' entries in the EDC export.'} /><//>`)}
@@ -9949,7 +9963,7 @@ function Drop({ kind, title, hint, name, sha }) {
 function StepFiles() {
   const I = S.imp, next = () => { I.parsed = parseDictionary(I.defText); if (!Object.keys(I.parsed.forms).length) { toast('No forms found in that dictionary', 'error'); return; } inspect(I); I.step = 1; rerender(); };
   return html`<div className="ef-drops"><${Drop} kind="def" title="REDCap Data Dictionary" hint="CSV from Project Setup › Data Dictionary." name=${I.defName} sha=${I.defSha} /><${Drop} kind="rec" title="Records Export" hint="CSV, raw values, one file. Column 1 must be the subject label." name=${I.recName} sha=${I.recSha} /></div>
-    <div className="ef-foot"><${Button} variant="ghost" startIcon="stars-light-sparkle" onClick=${async () => { await takeFile('def', 'synthetic_dictionary.csv', syntheticDictionary()); await takeFile('rec', `synthetic_export_${IMPORTS.length + 1}.csv`, syntheticRecords()); I.syn = true; toast('Synthetic files built from ' + DB.subjects.length + ' live subjects', 'info'); }}>Generate Synthetic Files<//><${Button} endIcon="arrow-forward" disabled=${!(I.defName && I.recName)} onClick=${next}>Map Fields<//></div>`;
+    <div className="ef-foot"><${Button} variant="ghost" startIcon="stars-light-sparkle" onClick=${async () => { await takeFile('def', 'synthetic_dictionary.csv', syntheticDictionary()); await takeFile('rec', `synthetic_export_${IMPORTS.length + 1}.csv`, syntheticRecords()); I.syn = true; toast('Synthetic files built from ' + DB.subjects.length + ' live subjects', 'info'); }}>Generate Synthetic Files<//><${Button} endIcon="arrow-forward" disabled=${!(I.defName && I.recName) || H.acq.state !== 'ready'} onClick=${next}>${H.acq.state === 'ready' ? 'Map Fields' : 'Loading Imaging ' + H.acq.n + '...'}<//></div>`;
 }
 function StepMap() {
   const I = S.imp, F = I.parsed.forms, keys = Object.keys(F), all = keys.flatMap(k => F[k].fields), maxN = Math.max(1, ...DB.subjects.map(s => sessionsOf(s).length));
@@ -10049,6 +10063,7 @@ async function exposureCheck() {
 const exposureVerdict = x => x.unblinding ? ['error', x.unblinding + ' Unblinding Values Readable', 'Treatment fields came back through the API.'] : x.values ? ['error', x.values + ' Clinical Values Readable', 'No treatment fields by name, but clinical values came back. Labs and adverse events can unblind on their own.'] : !x.rows ? ['warning', 'Inconclusive: No Containers Returned', 'Nothing came back, so this proves nothing about info.'] : x.errors ? ['warning', 'Inconclusive: Some Reads Refused', 'Check the table for which reads failed.'] : ['success', 'No EDC Values Returned', 'Containers came back without any EDC values on all four reads.'];
 
 async function removeAll() {
+  await ensureAcq();
   const jobs = [...DB.subjects.map(x => ['subjects', x]), ...DB.sessions.map(x => ['sessions', x]), ...DB.acquisitions.map(x => ['acquisitions', x])].filter(([, x]) => Object.keys(x.info.edc.forms).length || x.info.edc.fw_edits.length || x.info.edc.event); let bad = 0;
   for (const [t, x] of jobs) { try { await api('PATCH', `/${t}/${x._id}/info`, undefined, { delete: ['edc'] }); } catch (_) { bad++; } }
   try { await api('PATCH', `/projects/${PROJECT._id}/info`, undefined, { delete: ['edc'] }); } catch (_) { bad++; }
@@ -10057,8 +10072,8 @@ async function removeAll() {
 const CHECKS = [['Subjects, sessions and acquisitions all load', 'Calls below show OK'], ['Info writes land', 'Open a subject in Core and find info.edc'], ['Audit trail', 'Does Core show the info change, with before and after values?'], ['Part 11 lock', 'Lock the project in Core, reload, try a commit. Expect a refusal from the API, not only the app.'], ['Metadata bypass', 'Edit info.edc in Core directly. Expect it to work, which proves the need for a protected namespace.'], ['Blinding', 'Sign in as a real reader, not Preview Role, and press Run Exposure Check. Pass means containers came back with zero EDC values.']];
 function DiagPage() {
   const x = H.exposure;
-  return html`<${Head} eyebrow="Harness" title="Diagnostics" sub="What this session can do, every API call, and the live test list." actions=${html`<${Button} variant="outlined" color="slate" size="small" startIcon="rotate-refresh" onClick=${refresh}>Reload Data<//>`} />
-  <${Card}><${KV} rows=${[['Site', H.site + (H.writable ? ' · writes allowed' : ' · read only')], ['User', (H.user && (H.user.email || H.user._id)) || '—'], ['Project Roles', H.myRoles.join(', ') || 'None found'], ['Site Admin', H.admin ? 'Yes. Test as the target persona, not an admin.' : 'No'], ['Mapped Persona', ROLES[H.realRole] ? ROLES[H.realRole].name : '—'], ['Loaded', `${DB.subjects.length} subjects · ${DB.sessions.length} sessions · ${DB.acquisitions.length} acquisitions · ${FORM_KEYS.length} forms`], ['Build', 'edc-forms-harness 0.1.2']]} /><//>
+  return html`<${Head} eyebrow="Harness" title="Diagnostics" sub="What this session can do, every API call, and the live test list." actions=${html`<${Button} variant="outlined" color="slate" size="small" startIcon="rotate-refresh" onClick=${() => refresh(true)}>Reload Data<//>`} />
+  <${Card}><${KV} rows=${[['Site', H.site + (H.writable ? ' · writes allowed' : ' · read only')], ['User', (H.user && (H.user.email || H.user._id)) || '—'], ['Project Roles', H.myRoles.join(', ') || 'None found'], ['Site Admin', H.admin ? 'Yes. Test as the target persona, not an admin.' : 'No'], ['Mapped Persona', ROLES[H.realRole] ? ROLES[H.realRole].name : '—'], ['Loaded', `${DB.subjects.length} subjects · ${DB.sessions.length} sessions · ${H.acq.state === 'idle' ? 'acquisitions on demand' : (H.acq.state === 'ready' ? DB.acquisitions.length : H.acq.n) + ' acquisitions'} · ${FORM_KEYS.length} forms`], ['Build', 'edc-forms-harness 0.1.3']]} /><//>
   <${Section} title="Blinding Exposure" sub="Reads subjects the way any API client would. Reports counts only."><${Card}><div className="ef-stack">
     ${x ? html`<${AlertPanel} severity=${exposureVerdict(x)[0]} title=${exposureVerdict(x)[1]} description=${exposureVerdict(x)[2] + ' ' + x.user + ' at ' + x.at + '. Form definitions visible to this user: ' + x.definitions + '.'} />
       <div className="ef-scroll"><${Table} dense rowKey="name" rows=${x.ends} columns=${[{ key: 'name', header: 'Read' }, { key: 'rows', header: 'Containers', align: 'right' }, { key: 'withInfo', header: 'With Info', align: 'right' }, { key: 'withForms', header: 'With EDC Forms', align: 'right' }, { key: 'values', header: 'EDC Values', align: 'right' }, { key: 'unblinding', header: 'Unblinding', align: 'right' }, { key: 'error', header: 'Refused', render: r => r.error || '—' }]} /></div>` : html`<${T} variant="p3" color="muted">Most useful when signed in as a blinded reader. Preview Role does not change what the API returns.<//>`}
@@ -10130,7 +10145,7 @@ function TopBar() {
 }
 const PAGES = { forms: FormsPage, subject: SubjectPage, conflicts: ConflictsPage, changes: ChangesPage, import: ImportPage, access: AccessPage, embed: EmbedPage, diag: DiagPage };
 function App() {
-  const [, force] = React.useReducer(x => x + 1, 0); rerender = force;
+  const [, force] = React.useReducer(x => x + 1, 0); rerender = force; window.__efRender = force;
   React.useEffect(() => {
     const mq = matchMedia('(max-width: 900px)'); const sync = () => { S.narrow = mq.matches; S.navCollapsed = mq.matches; force(); }; mq.addEventListener('change', sync); sync();
     const onHash = () => { const h = location.hash.slice(1); if (PAGES[h] && h !== S.view) go(h); }; addEventListener('hashchange', onHash);
@@ -10139,12 +10154,12 @@ function App() {
   }, []);
   const Page = PAGES[S.view] || FormsPage;
   return html`<div className="ef-app"><${SideNav} /><div className="ef-col"><${TopBar} /><main className="ef-main"><div className="ef-wrap">
-    ${H.err ? html`<${AlertPanel} severity="error" title="Could Not Connect" description=${H.err} />` : H.loading ? html`<${T} variant="p2" color="muted">Loading ${H.site || 'site'}...<//>` : role().view || S.view === 'diag' ? html`<${Page} />` : html`<${Card}><${ContextLayout} icon="private-mode-protection-circle" title="Forms Hidden While Blinded" description="Clinical forms can reveal treatment or outcome, so blinded readers don't see them." /><//>`}
+    ${H.err ? html`<${AlertPanel} severity="error" title="Could Not Connect" description=${H.err} />` : H.loading ? html`<div className="ef-stack"><${Ghost} variant="title" width=${220} /><div className="ef-stats">${[1, 2, 3, 4, 5].map(i => html`<${Ghost} key=${i} variant="rect" height=${88} />`)}</div><${Ghost} variant="rect" height=${360} /></div>` : role().view || S.view === 'diag' ? html`<${Page} />` : html`<${Card}><${ContextLayout} icon="private-mode-protection-circle" title="Forms Hidden While Blinded" description="Clinical forms can reveal treatment or outcome, so blinded readers don't see them." /><//>`}
   </div></main></div><${Dialogs} />${S.toast && html`<${SnackbarContainer} align="center"><${Snackbar} key=${S.toast.id} title=${S.toast.title} severity=${S.toast.severity} showClose onClose=${() => { S.toast = null; rerender(); }} /><//>`}</div>`;
 }
 
 /* ---------- boot ---------- */
-async function refresh() { try { const keep = S.sub; await loadAll(); S.sub = subj(keep) ? keep : (DB.subjects[0] || {}).label; } catch (e) { toast('Reload failed', 'error'); } rerender(); }
+async function refresh(full) { try { const keep = S.sub; await loadAll(); if (full === true) ensureAcq(true); S.sub = subj(keep) ? keep : (DB.subjects[0] || {}).label; } catch (e) { toast('Reload failed', 'error'); } rerender(); }
 async function boot() {
   try {
     H.ext = await Flywheel.initExtension({ scope: 'ReadWrite', validateOrigin: o => /^https:\/\/[a-z0-9.-]+\.flywheel\.io$/.test(o) });
@@ -10160,7 +10175,7 @@ async function boot() {
     const who = H.user.email || uid, nm = [H.user.firstname, H.user.lastname].filter(Boolean).join(' ') || who; Object.values(ROLES).forEach(r => { r.who = who; r.display = nm; });
     if (!H.writable) Object.assign(ROLES.dm, { edit: false, importer: false, resolve: false, setup: false });
     S.imp = blankImp(); S.sub = (DB.subjects[0] || {}).label; S.form = FORM_KEYS[0]; S.emb = FORM_KEYS[0];
-    addEventListener('focus', () => { if (!S.edit && !S.dialog && S.imp.step === 0 && Date.now() - (H.t || 0) > 30000) { H.t = Date.now(); refresh(); } });
+    addEventListener('focus', () => { if (!S.edit && !S.dialog && S.imp.step === 0 && Date.now() - (H.t || 0) > 120000) { H.t = Date.now(); refresh(); } });
   } catch (e) { H.err = String(e && e.message || e); H.loading = false; }
   rerender();
 }
